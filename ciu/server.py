@@ -12,6 +12,7 @@ The point of the proxy is a stable address. Applications point at
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 from pathlib import Path
 
@@ -32,6 +33,107 @@ MODEL_DIR = Path.home() / ".ciu" / "models"
 
 app = FastAPI(title="CIU")
 runner = LlamaRunner()
+
+
+# ---------------------------------------------------------- request guard
+#
+# CIU listens on loopback, but loopback is not private from the browser. Any
+# website the user visits can send requests to 127.0.0.1:8674: a form post to
+# /api/unload, or a text/plain POST to /v1/chat/completions that burns the
+# GPU. With DNS rebinding a site can even read the responses. Two checks
+# close that:
+#
+#   Host   must name loopback. A rebound domain arrives with its own name in
+#          Host, so this alone defeats DNS rebinding.
+#   Origin browsers attach it to every cross-origin request and to all POSTs,
+#          and pages cannot forge it. No Origin means a non-browser client
+#          (curl, a Blender or Godot addon, a script), which is allowed.
+#          CIU's own page is allowed, and so are the specific extensions
+#          named in CIU_EXTENSION_ORIGINS. Everything else is refused.
+#
+# Two things this deliberately does NOT do.
+#
+# It does not refuse requests that carry no Origin, because that is every
+# non-browser client CIU exists to serve. The consequence is that a website
+# can still reach CIU with a cross-site GET, which carries no Origin: an
+# <img src> or a top-level navigation. That is safe only while no GET
+# endpoint changes state, which is true today (/api/status and / are the
+# only ones, and both are read-only). Any new state-changing endpoint must
+# be POST. This is a rule about the routes, not something the guard can
+# enforce.
+#
+# It does not trust every browser extension. An earlier draft allowed any
+# chrome-extension:// origin, which hands a local GPU and the user's model
+# to every extension the user has ever installed, including one that changes
+# hands later. Only the IDs named below are allowed.
+#
+# CIU_ALLOWED_ORIGINS adds web origins, comma separated, for a local web app
+# the user wants to connect on purpose.
+# CIU_EXTENSION_ORIGINS replaces the extension allowlist, which is how you
+# work on an unpacked extension whose ID changes on every reload.
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
+
+# The CIU Browser extension. Confirmed by header capture: its GET /api/status
+# carries no Origin at all, but POST /v1/chat/completions carries this one, so
+# without this entry the panel would report "Connected" and then fail every
+# task with a 403.
+#
+# This is the UNPACKED id, which Chrome derives from the folder path. It will
+# differ on another machine and will change again when the extension is
+# published, unless a "key" is pinned in its manifest. Set
+# CIU_EXTENSION_ORIGINS to override, comma separated.
+_DEFAULT_EXTENSION_ORIGINS = "chrome-extension://iafbfooieeiknhppomkeikcjcihodnge"
+
+
+def _env_origins(name: str, default: str = "") -> set[str]:
+    return {o.strip().lower().rstrip("/")
+            for o in os.environ.get(name, default).split(",")
+            if o.strip()}
+
+
+def _host_name(host_header: str) -> str:
+    """The name part of a Host header, without the port.
+
+    IPv6 literals arrive bracketed ("[::1]:8674"), which is why the bracket
+    case is handled first: splitting an unbracketed "::1" on the last colon
+    would yield "::", and the request would be refused.
+    """
+    h = host_header.strip().lower()
+    if h.startswith("["):
+        return h[: h.find("]") + 1]
+    if h.count(":") > 1:          # bare IPv6 literal, no port
+        return f"[{h}]"
+    return h.rsplit(":", 1)[0] if ":" in h else h
+
+
+def _origin_allowed(origin: str) -> bool:
+    origin = origin.strip().lower().rstrip("/")
+    own = {f"http://{h}:{PORT}" for h in ("127.0.0.1", "localhost", "[::1]")}
+    if origin in own:
+        return True
+    if origin in _env_origins("CIU_EXTENSION_ORIGINS",
+                              _DEFAULT_EXTENSION_ORIGINS):
+        return True
+    return origin in _env_origins("CIU_ALLOWED_ORIGINS")
+
+
+@app.middleware("http")
+async def guard(request: Request, call_next):
+    host = request.headers.get("host", "")
+    if _host_name(host) not in _LOOPBACK_HOSTS:
+        return JSONResponse(status_code=403, content={"error": {
+            "message": "CIU only answers requests addressed to this machine.",
+            "type": "ciu_forbidden_host"}})
+    origin = request.headers.get("origin")
+    if origin is not None and not _origin_allowed(origin):
+        return JSONResponse(status_code=403, content={"error": {
+            "message": (f"Requests from {origin} are not allowed. Set "
+                        f"CIU_ALLOWED_ORIGINS to allow a local web app, or "
+                        f"CIU_EXTENSION_ORIGINS for a browser extension."),
+            "type": "ciu_forbidden_origin"}})
+    return await call_next(request)
+
 
 _download = {"active": False, "model_id": None, "pct": 0.0, "error": None}
 
@@ -131,6 +233,47 @@ def size_for(model) -> int:
     return model.size_bytes
 
 
+# ------------------------------------------------------ context and batch
+
+# The micro-batch and the context are not independent. llama.cpp's largest
+# batch-scaled allocation is the logits buffer, n_ubatch x n_vocab x 4 bytes,
+# which on Qwen's 152k vocabulary is 311 MiB at 512 and 155 MiB at 256.
+#
+# On a machine with room, 512 is free prefill speed and there is no reason to
+# give it up. On a tight one that 155 MiB is the difference between offering
+# 4k of context and offering none. So the larger batch is tried first and the
+# smaller is a fallback, rather than either being a fixed default.
+#
+# Measured on an Apple M1 8GB with Qwen3.5-9B-NF4DQ: at 512 even 8k fails to
+# load; at 256, 8k loads and 12k does not.
+PREFERRED_BATCH = 512
+FALLBACK_BATCH = 256
+
+
+def plan_for(model, available: int, n_ctx: int | None = None):
+    """Budget, micro-batch and training context for one model.
+
+    Returns the batch that was chosen alongside the budget computed with it,
+    so that what the page shows and what the runner launches can never
+    disagree. They did disagree before: the budget assumed 256 while a
+    non-tight load passed no batch flags at all and got llama-server's 512.
+    """
+    shape = shape_for(model)
+    weights = size_for(model)
+    n_ctx_train = getattr(shape, "n_ctx_train", None) or model.n_ctx_train
+
+    plan = None
+    for n_batch in (PREFERRED_BATCH, FALLBACK_BATCH):
+        b = budget_for(weights, shape, available, n_batch=n_batch)
+        plan = (b, n_batch, n_ctx_train)
+        target = n_ctx or max_fitting_context(b, n_ctx_train)
+        if target and b.fixed_bytes + b.kv_bytes_at(target) <= available:
+            return plan
+    # Nothing fits at either batch. Return the smaller one: it is the closest
+    # to fitting, and the estimate is advisory anyway.
+    return plan
+
+
 # ----------------------------------------------------------------- CIU API
 
 def _resident_bytes() -> int:
@@ -142,7 +285,9 @@ def _resident_bytes() -> int:
     if not model:
         return 0
     shape = shape_for(model)
-    b = budget_for(size_for(model), shape, 0)
+    # Use the batch the runner was actually started with, not a default.
+    n_batch = runner.config.n_batch or PREFERRED_BATCH
+    b = budget_for(size_for(model), shape, 0, n_batch=n_batch)
     return b.fixed_bytes + b.kv_bytes_at(runner.config.n_ctx)
 
 
@@ -161,8 +306,7 @@ def status():
         path = model_path(m)
         downloaded = path.is_file()
         shape = shape_for(m)
-        b = budget_for(size_for(m), shape, available)
-        n_ctx_train = getattr(shape, "n_ctx_train", None) or m.n_ctx_train
+        b, n_batch, n_ctx_train = plan_for(m, available)
         opts = context_options(b, n_ctx_train)
         # Default to the largest context that fits entirely. Zero means the
         # model will not load at all on the memory currently free.
@@ -179,6 +323,7 @@ def status():
             "contexts": opts,
             "default_ctx": default_ctx,
             "max_ctx": max_ctx,
+            "n_batch": n_batch,
             "n_layer": shape.n_layer,
             "n_ctx_train": n_ctx_train,
         })
@@ -235,10 +380,7 @@ def load(model_id: str, n_ctx: int | None = None, mtp: bool = False):
         raise HTTPException(400, "model not downloaded")
 
     hw = detect(_resident_bytes())
-    shape = shape_for(model)
-    b = budget_for(size_for(model), shape, hw.free_bytes)
-
-    n_ctx_train = model.n_ctx_train
+    b, n_batch, n_ctx_train = plan_for(model, hw.free_bytes, n_ctx)
     max_ctx = max_fitting_context(b, n_ctx_train)
 
     # The estimate is advisory, never a veto. It is built from a model of how
@@ -251,18 +393,20 @@ def load(model_id: str, n_ctx: int | None = None, mtp: bool = False):
     expected = (b.fixed_bytes + b.kv_bytes_at(ctx)) / GIB
     tight = expected > hw.free_gib
 
-    # A smaller batch shrinks the compute buffer, which is worth doing when
-    # memory is the binding constraint.
+    # n_batch is always passed explicitly. Leaving it unset means
+    # llama-server picks 512, which would silently contradict whatever the
+    # budget above was computed with.
     runner.start(RunConfig(
         model_path=str(path),
         n_ctx=ctx,
         backend=hw.backend,
         use_mtp=mtp and model.has_mtp,
-        n_batch=256 if tight else None,
+        n_batch=n_batch,
     ))
     return {
         "loading": True,
         "n_ctx": ctx,
+        "n_batch": n_batch,
         "expected_gib": round(expected, 2),
         "free_gib": hw.free_gib,
         "tight": tight,
