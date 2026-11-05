@@ -20,6 +20,23 @@ from pathlib import Path
 # Backends that can hold layers in device memory. CPU never can.
 GPU_BACKENDS = ("cuda", "metal")
 
+# A backend that runs out of memory does not necessarily kill the process.
+# On Metal the command buffer fails, the backend latches into an error state,
+# and llama-server still prints "listening" and answers /health with 200.
+# Measured: every failing load in testing reported a healthy server. So the
+# log is the only reliable signal and it has to override the health check.
+OOM_MARKERS = (
+    "kIOGPUCommandBufferCallbackErrorOutOfMemory",   # Metal
+    "Insufficient Memory",                            # Metal
+    "CUDA error: out of memory",                      # CUDA
+    "cudaMalloc failed",                              # CUDA
+    "failed to allocate",                             # generic ggml
+)
+
+
+def _is_oom(line: str) -> bool:
+    return any(m in line for m in OOM_MARKERS)
+
 
 def find_llama_server() -> str | None:
     """Locate llama-server: PATH, env override, or the usual build locations."""
@@ -60,7 +77,10 @@ class RunConfig:
     # 99 offloads everything. A smaller number splits the model, keeping the
     # first N layers on the GPU and running the rest on CPU.
     n_gpu_layers: int = 99
-    n_batch: int | None = None
+    # Defaults to 256, not None. None meant the flags were never passed and
+    # llama-server's own default of 512 applied, which costs an extra 155 MiB
+    # of logits buffer and was the difference between 2k and 8k on an M1.
+    n_batch: int | None = 256
 
 
 class LlamaRunner:
@@ -94,9 +114,18 @@ class LlamaRunner:
         if cfg.flash_attn and ngl > 0:
             args += ["-fa", "on"]
 
-        # llama-server reserves a compute buffer sized by the batch, not by
-        # the context. The 2048 default costs hundreds of megabytes, which is
-        # the difference between loading and failing on a tight machine.
+        # One sequence slot. llama-server defaults to 4, and -c is PER SLOT,
+        # so the default quadruples the KV cache to serve parallelism CIU
+        # never uses: four slots at 8k hold 32k tokens. On Qwen3.5-9B that is
+        # 1.07 GiB instead of 0.27. Largest single saving available, and it
+        # costs nothing in quality or speed.
+        args += ["-np", "1"]
+
+        # The compute buffer is sized by the micro-batch, not by the context,
+        # and its largest component is the logits buffer at
+        # n_ubatch x n_vocab x 4 bytes. On Qwen's 152k vocab that is 311 MiB
+        # at 512 and 155 MiB at 256. Smaller batches slow prefill but leave
+        # decode and quality untouched.
         if cfg.n_batch:
             args += ["-b", str(cfg.n_batch), "-ub", str(cfg.n_batch)]
         if cfg.use_mtp:
@@ -145,9 +174,15 @@ class LlamaRunner:
             if len(self.log) > 400:
                 del self.log[:200]
 
+    def _saw_oom(self) -> bool:
+        # Snapshot: _pump_log appends from another thread.
+        return any(_is_oom(line) for line in list(self.log))
+
     def _await_ready(self, timeout: int) -> None:
         """Poll /health. The port opens long before the weights are loaded, so
-        watching the socket alone reports ready far too early."""
+        watching the socket alone reports ready far too early. A passing
+        /health is also not sufficient: a backend that has run out of memory
+        still answers 200, so the log is checked first on every pass."""
         import httpx
 
         deadline = time.time() + timeout
@@ -156,9 +191,30 @@ class LlamaRunner:
                 self.state = "error"
                 self.error = "llama-server exited during load"
                 return
+
+            if self._saw_oom():
+                self.state = "error"
+                self.error = (
+                    "Out of memory while loading. Try a shorter context, or "
+                    "close other applications."
+                )
+                self.stop()
+                return
+
             try:
                 r = httpx.get(f"{self.base_url}/health", timeout=2)
                 if r.status_code == 200:
+                    # One last look: the OOM can land between the check above
+                    # and the response, and a server reported ready here will
+                    # fail on the user's first message instead.
+                    if self._saw_oom():
+                        self.state = "error"
+                        self.error = (
+                            "Out of memory while loading. Try a shorter "
+                            "context, or close other applications."
+                        )
+                        self.stop()
+                        return
                     self.state = "ready"
                     return
             except Exception:
@@ -177,7 +233,8 @@ class LlamaRunner:
                 self.proc.kill()
         self.proc = None
         self.port = None
-        self.state = "stopped"
+        if self.state != "error":
+            self.state = "stopped"
 
     def status(self) -> dict:
         return {

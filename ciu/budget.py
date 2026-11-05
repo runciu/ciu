@@ -21,27 +21,36 @@ GIB = 1024 ** 3
 MIB = 1024 ** 2
 
 # Beyond weights and cache, llama.cpp allocates a compute buffer, a logits
-# buffer and some backend scratch. The compute buffer scales with the BATCH
-# size, not the context, which is why -b 2048 costs hundreds of megabytes and
-# -b 128 costs tens.
+# buffer and some backend scratch. These scale with the BATCH size, not the
+# context, which is why -ub 512 costs hundreds of megabytes and -ub 128 costs
+# tens.
 #
 # A flat one-gigabyte reserve was the earlier guess here and it was both wrong
 # and harmful: it refused models that run perfectly well, which on an 8GB
-# machine meant refusing everything. The estimate below is smaller and scales
-# with batch. It can still be wrong, so it is advisory: the user may load
+# machine meant refusing everything. The estimate below scales with batch and
+# vocabulary. It can still be wrong, so it is advisory: the user may load
 # anyway and the backend's own out-of-memory error is the real answer.
-BASE_OVERHEAD = 192 * MIB          # backend scratch, logits, allocator slack
-DEFAULT_BATCH = 512
+BASE_OVERHEAD = 192 * MIB          # backend scratch, allocator slack
+DEFAULT_BATCH = 256
+DEFAULT_VOCAB = 151936             # Qwen3.x
 
 
-def overhead_bytes(n_embd: int = 4096, n_batch: int = DEFAULT_BATCH) -> int:
+def overhead_bytes(n_embd: int = 4096, n_batch: int = DEFAULT_BATCH,
+                   n_vocab: int = DEFAULT_VOCAB) -> int:
     """Rough non-weight, non-cache allocation.
 
-    The compute buffer holds a few activation tensors of batch x embedding in
-    fp16. Four is a workable multiplier across the models measured.
+    Two terms scale with the micro-batch. The logits buffer dominates:
+    n_batch x n_vocab x 4 bytes, which on a 152k vocab is 155 MiB at batch
+    256 and 311 MiB at 512. Activations are the smaller term, a few tensors
+    of batch x embedding in fp16.
+
+    Measured on an Apple M1 (8GB) with Qwen3.5-9B-NF4DQ: at batch 256 an 8192
+    context loads and 12288 does not; at batch 512 even 8192 fails. This
+    formula reproduces all three outcomes.
     """
-    compute = 4 * n_batch * n_embd * 2
-    return BASE_OVERHEAD + compute
+    logits = n_batch * n_vocab * 4
+    activations = 4 * n_batch * n_embd * 2
+    return BASE_OVERHEAD + logits + activations
 
 
 # Kept for callers that have no shape to hand.
@@ -58,6 +67,8 @@ class ModelShape:
     # Layers using full attention. On a conventional model this equals
     # n_layer. On a hybrid it is only the subset that keeps a growing cache.
     n_attn_layer: int | None = None
+    # Drives the logits buffer, which is the largest batch-scaled allocation.
+    n_vocab: int = DEFAULT_VOCAB
 
     @property
     def cache_layers(self) -> int:
@@ -122,11 +133,19 @@ class Budget:
 
 
 def budget_for(weights_bytes: int, shape: ModelShape, available_bytes: int,
-               kv_bits: int = 16, n_batch: int = DEFAULT_BATCH) -> Budget:
+               kv_bits: int = 16, n_batch: int = DEFAULT_BATCH,
+               n_parallel: int = 1) -> Budget:
+    """Cost of one model on one machine.
+
+    n_parallel multiplies the cache: llama-server's -c is PER SLOT, so four
+    slots at 8k hold 32k tokens, not 8k. llama-server defaults to 4 slots.
+    CIU runs one; the parameter exists so the arithmetic stays honest if that
+    ever changes.
+    """
     return Budget(
         weights_bytes=weights_bytes,
-        overhead_bytes=overhead_bytes(shape.n_embd, n_batch),
-        kv_per_token=kv_bytes_per_token(shape, kv_bits),
+        overhead_bytes=overhead_bytes(shape.n_embd, n_batch, shape.n_vocab),
+        kv_per_token=kv_bytes_per_token(shape, kv_bits) * n_parallel,
         available_bytes=available_bytes,
     )
 
