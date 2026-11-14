@@ -12,6 +12,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -48,14 +49,61 @@ def find_llama_server() -> str | None:
     if found:
         return found
 
+    # .exe matters: on Windows shutil.which finds it through PATHEXT, but a
+    # direct path check does not, so the engine CIU installs into ~/.ciu/bin
+    # was invisible to this function on the one platform that needs the
+    # suffix.
+    exe = ".exe" if os.name == "nt" else ""
     for candidate in (
-        Path.home() / "llama.cpp/build/bin/llama-server",
-        Path.home() / ".ciu/bin/llama-server",
-        Path("/usr/local/bin/llama-server"),
+        Path.home() / f"llama.cpp/build/bin/llama-server{exe}",
+        Path.home() / f".ciu/bin/llama-server{exe}",
+        Path(f"/usr/local/bin/llama-server{exe}"),
     ):
         if candidate.is_file():
             return str(candidate)
+
+    # The Windows CUDA archive unpacks into a subdirectory alongside its DLLs
+    # rather than dropping the binary at the top level.
+    bindir = Path.home() / ".ciu" / "bin"
+    if bindir.is_dir():
+        for found in bindir.rglob(f"llama-server{exe}"):
+            if found.is_file():
+                return str(found)
     return None
+
+
+def _library_env(binary: str) -> dict:
+    """Environment that lets llama-server find the libraries shipped with it.
+
+    The published builds put their shared libraries in the same directory as
+    the executable, but the loader does not search that directory on its own.
+    Worse, the Linux release has a RUNPATH baked to the CI machine's build
+    tree:
+
+        Library runpath: [/home/runner/work/llama.cpp/llama.cpp/build/bin:]
+
+    which exists nowhere outside the GitHub runner. The binary then fails with
+    "error while loading shared libraries", and because llama-server dies
+    before printing anything CIU recognises, it surfaces as a bare "exited
+    during load".
+
+    Pointing the platform's library search variable at the binary's own
+    directory fixes it regardless of what the publisher baked in, which is
+    better than depending on a particular RPATH being correct. Windows needs
+    no help, since it always searches the executable's own directory, but
+    adding the entry is harmless and keeps one code path.
+    """
+    env = os.environ.copy()
+    bindir = str(Path(binary).resolve().parent)
+    if sys.platform == "darwin":
+        key = "DYLD_LIBRARY_PATH"
+    elif os.name == "nt":
+        key = "PATH"
+    else:
+        key = "LD_LIBRARY_PATH"
+    existing = env.get(key, "")
+    env[key] = bindir + (os.pathsep + existing if existing else "")
+    return env
 
 
 def free_port(start: int = 8700) -> int:
@@ -159,6 +207,8 @@ class LlamaRunner:
             self.proc = subprocess.Popen(
                 args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1,
+                cwd=str(Path(binary).parent),
+                env=_library_env(binary),
             )
 
         threading.Thread(target=self._pump_log, daemon=True).start()

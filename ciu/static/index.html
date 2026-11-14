@@ -156,6 +156,11 @@
     Load a model to see how much conversation it will hold.
   </div>
 
+  <div id="enginebox" hidden>
+    <h2>Engine</h2>
+    <div class="rows" id="enginerows"></div>
+  </div>
+
   <h2>Models</h2>
   <div class="rows" id="rows"></div>
 
@@ -251,6 +256,53 @@ function render(s){
   }
 
   // model rows
+  // Engine card. CIU ships without llama-server, so until one is installed
+  // this is the only thing on the page worth acting on. It disappears once
+  // the engine is there, rather than sitting around as permanent furniture.
+  const eng = s.engine || {};
+  const ebox = document.getElementById("enginebox");
+  const erows = document.getElementById("enginerows");
+  ebox.hidden = !!s.llama_server;
+  if (!s.llama_server){
+    erows.innerHTML = "";
+    const el = document.createElement("div");
+    el.className = "row" + (eng.supported ? "" : " no");
+
+    let sub;
+    if (!eng.supported){
+      sub = eng.reason || "This machine is not supported yet.";
+    } else if (eng.error){
+      sub = "Setup failed: " + eng.error;
+    } else if (eng.active){
+      sub = `Downloading, ${eng.pct || 0}%`;
+    } else {
+      sub = `${eng.asset} for ${eng.platform}.`
+          + (eng.warning ? " " + eng.warning : "");
+    }
+
+    const left = document.createElement("div");
+    left.innerHTML = `<div class="nm">Inference engine</div>
+      <div class="sub">${sub}</div>`;
+
+    const fig = document.createElement("div");
+    fig.className = "fig";
+    fig.innerHTML = eng.active
+      ? `<b>${Math.round(eng.pct || 0)}%</b>downloading`
+      : `<b>—</b>${eng.supported ? "not installed" : "unavailable"}`;
+
+    const act = document.createElement("div");
+    if (eng.supported){
+      const b = document.createElement("button");
+      b.textContent = eng.active ? "Setting up…"
+                    : (eng.error ? "Try again" : "Set up");
+      b.disabled = busy || eng.active;
+      b.onclick = () => call("/api/setup-engine");
+      act.appendChild(b);
+    }
+    el.append(left, fig, act);
+    erows.appendChild(el);
+  }
+
   const rows = document.getElementById("rows");
   rows.innerHTML = "";
   for (const m of s.models){
@@ -346,8 +398,11 @@ function render(s){
   const st = document.getElementById("state");
   st.className = "state";
   if (!s.llama_server){
-    st.className = "state err";
-    st.textContent = "llama-server not found. Build the NF4DQ fork, or set CIU_LLAMA_SERVER to its path.";
+    const eng2 = s.engine || {};
+    st.className = eng2.supported ? "state" : "state err";
+    st.textContent = eng2.supported
+      ? "No engine yet. Set it up above and CIU will fetch the right build for this machine."
+      : (eng2.reason || "No engine is available for this machine.");
   } else if (s.download.error){
     st.className = "state err";
     st.textContent = "Download failed: " + s.download.error;

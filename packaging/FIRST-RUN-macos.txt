@@ -1,0 +1,68 @@
+CIU for macOS (Apple Silicon)
+=============================
+
+Drag CIU.app to your Applications folder.
+
+This build is not signed with an Apple Developer certificate, so macOS will
+refuse to open it until you say otherwise. That is Gatekeeper doing its job on
+software it cannot trace to a registered developer, and it happens with any
+unsigned app, not just this one.
+
+One command clears it.
+
+
+FIRST RUN
+---------
+
+1. Drag CIU.app to Applications.
+
+2. Open Terminal and paste this, then press Return:
+
+       xattr -dr com.apple.quarantine /Applications/CIU.app
+
+3. Open CIU from Applications, Launchpad or Spotlight.
+
+A Terminal window opens showing what CIU is doing, and your browser opens at
+the page. Leave that Terminal window open; closing it stops CIU.
+
+
+IF STEP 2 REPORTS "No such xattr"
+---------------------------------
+
+Nothing is wrong. The app was never quarantined, usually because it was moved
+with the command line rather than downloaded in a browser. Carry on to step 3.
+
+
+THE OTHER WAY, WITHOUT TERMINAL
+-------------------------------
+
+Double-click CIU.app. macOS blocks it. Open System Settings, go to Privacy and
+Security, scroll to the bottom, and there will be a line saying CIU was
+blocked, with an "Open Anyway" button. Click it, then open CIU again and
+confirm.
+
+
+WHY A TERMINAL WINDOW
+---------------------
+
+CIU runs a small server on your machine. The window is both the log, which is
+the first place to look when something goes wrong, and the off switch.
+
+
+WHAT HAPPENS NEXT
+-----------------
+
+CIU does not include the inference engine. The page offers to fetch the Metal
+build of llama-server, about 20 MB, and then offers to download a model, which
+is several gigabytes.
+
+Both are one click and both show progress.
+
+
+IF SOMETHING GOES WRONG
+-----------------------
+
+The Terminal window is the log. Whatever it says is the real error, and it is
+more useful than anything the page shows.
+
+Issues: https://github.com/runciu/ciu/issues

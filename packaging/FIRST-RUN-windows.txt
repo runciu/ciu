@@ -1,0 +1,65 @@
+CIU for Windows (64-bit)
+========================
+
+This build is not signed with a code-signing certificate, so Windows will warn
+about it the first time. That is SmartScreen reacting to a program it has not
+seen before, not to anything it found in the file.
+
+
+FIRST RUN
+---------
+
+1. Unzip the folder somewhere you want to keep it. Do not run it from inside
+   the zip: Windows extracts to a temporary folder and CIU will appear to
+   lose its settings every time.
+
+2. Double-click `ciu.exe`.
+
+3. A blue box says "Windows protected your PC". Click "More info", then
+   "Run anyway".
+
+A console window opens, prints an address, and your browser opens at it.
+Leave the console window open; closing it stops CIU.
+
+
+IF WINDOWS DEFENDER QUARANTINES IT
+----------------------------------
+
+This happens occasionally to programs built with PyInstaller, which is the
+tool that packages CIU into a single .exe. The packaging method is shared with
+some malware, so heuristic scanners sometimes flag the shape of the file
+rather than anything in it.
+
+If it happens, Defender puts the file in quarantine and the exe disappears.
+To restore it: open Windows Security, go to Virus and threat protection,
+Protection history, find the item, and choose Restore.
+
+If you would rather not, that is a reasonable choice. You can run CIU from
+source instead, which needs Python 3.10 or newer:
+
+    git clone https://github.com/runciu/ciu
+    cd ciu
+    pip install -r requirements.txt
+    python run.py
+
+
+WHAT HAPPENS NEXT
+-----------------
+
+CIU does not include the inference engine. The page will offer to fetch the
+right llama-server build for your machine. If you have an NVIDIA card that is
+the CUDA build, about 200 MB. Without one it is the CPU build, about 10 MB,
+and generation will be slow.
+
+Then it offers to download a model, which is several gigabytes.
+
+Both are one click and both show progress.
+
+
+IF SOMETHING GOES WRONG
+-----------------------
+
+The console window is the log. Whatever it says is the real error, and it is
+more useful than anything the page shows.
+
+Issues: https://github.com/runciu/ciu/issues

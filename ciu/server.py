@@ -27,6 +27,7 @@ from .gguf_read import read_shape
 from .gguf_remote import file_size as remote_size, read_remote
 from .hardware import detect
 from .runner import LlamaRunner, RunConfig, find_llama_server
+from . import bootstrap
 
 PORT = 8674
 MODEL_DIR = Path.home() / ".ciu" / "models"
@@ -136,6 +137,10 @@ async def guard(request: Request, call_next):
 
 
 _download = {"active": False, "model_id": None, "pct": 0.0, "error": None}
+
+# Engine setup reports the same way a model download does, so the page can
+# render both with one code path.
+_engine_setup = {"active": False, "pct": 0.0, "error": None, "note": ""}
 
 
 def model_path(model) -> Path:
@@ -336,8 +341,42 @@ def status():
         "runner": runner.status(),
         "download": _download,
         "llama_server": find_llama_server(),
+        "engine": {**bootstrap.describe(), **_engine_setup},
         "base_url": f"http://127.0.0.1:{PORT}/v1",
     }
+
+
+@app.post("/api/setup-engine")
+def setup_engine():
+    """Fetch llama-server for this machine.
+
+    Runs on a thread and reports through /api/status, the same shape as a
+    model download, because the Windows CUDA archive is over 200 MB and a
+    request that blocks for that long is indistinguishable from a hang.
+    """
+    if _engine_setup["active"]:
+        raise HTTPException(409, "engine setup is already running")
+    if find_llama_server():
+        return {"started": False, "reason": "already installed"}
+
+    def work():
+        _engine_setup.update(active=True, pct=0.0, error=None, note="")
+
+        def progress(got, total):
+            _engine_setup["pct"] = round(100 * got / total, 1)
+
+        try:
+            p = bootstrap.ensure_llama_server(
+                progress=progress,
+                log=lambda m: _engine_setup.update(note=m))
+            _engine_setup.update(pct=100.0, note=f"Engine ready at {p}")
+        except Exception as e:
+            _engine_setup["error"] = str(e)
+        finally:
+            _engine_setup["active"] = False
+
+    threading.Thread(target=work, daemon=True).start()
+    return {"started": True}
 
 
 @app.post("/api/download/{model_id}")
@@ -492,9 +531,25 @@ async def proxy(path: str, request: Request):
 
 # ------------------------------------------------------------------- page
 
+def _resource(*parts) -> Path:
+    """Locate a bundled data file.
+
+    PyInstaller unpacks data to a temporary directory and points sys._MEIPASS
+    at it, so __file__ is inside a build tree that does not exist at runtime.
+    Reading the page relative to __file__ works when running from source and
+    raises FileNotFoundError in the packaged build, which is the sort of thing
+    that only shows up after shipping.
+    """
+    import sys
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    if getattr(sys, "_MEIPASS", None):
+        return base.joinpath("ciu", *parts)
+    return base.joinpath(*parts)
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
-    page = Path(__file__).parent / "static" / "index.html"
+    page = _resource("static", "index.html")
     # The charset must be explicit. Without it Edge falls back to Windows-1252
     # and every non-ASCII character in the page renders as mojibake.
     return HTMLResponse(page.read_text(encoding="utf-8"),
@@ -503,9 +558,28 @@ def index():
 
 def main():
     import uvicorn
+    import webbrowser
+
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"CIU on http://127.0.0.1:{PORT}")
-    print(f"API   http://127.0.0.1:{PORT}/v1")
+    url = f"http://127.0.0.1:{PORT}"
+
+    print("CIU")
+    print(f"  page  {url}")
+    print(f"  API   {url}/v1")
+    engine = find_llama_server()
+    if engine:
+        print(f"  engine {engine}")
+    else:
+        print("  engine not installed yet, the page will offer to fetch it")
+    print()
+    print("Leave this window open. Closing it stops CIU.")
+
+    # Someone who double-clicked an application expects a window, not a
+    # terminal. The delay is because the browser must not arrive before
+    # uvicorn is accepting connections.
+    if os.environ.get("CIU_NO_BROWSER") != "1":
+        threading.Timer(1.5, lambda: webbrowser.open(url)).start()
+
     uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="warning")
 
 

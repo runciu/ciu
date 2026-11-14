@@ -1,0 +1,7 @@
+# Runtime dependencies. Pinned to major versions rather than exact ones: the
+# build runs on two platforms and an exact pin that lacks a wheel for one of
+# them turns into a source build and a twenty-minute CI failure.
+fastapi>=0.110,<1.0
+uvicorn>=0.27,<1.0
+httpx>=0.27,<1.0
+huggingface_hub>=0.23,<1.0

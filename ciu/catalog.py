@@ -66,6 +66,27 @@ CATALOG: list[Model] = [
         tags=["small", "hybrid"],
     ),
     Model(
+        id="ornith15-9b-nf4dq",
+        name="Ornith 1.5 9B",
+        repo="kayceesamuel/Ornith-1.5-9B-NF4DQ",
+        filename="Ornith-1.5-9B-NF4DQ.gguf",
+        size_bytes=5_098_843_744,
+        # Hybrid, like the Qwen pair: 9 of 33 layers use full attention and
+        # the other 24 are linear, carrying a fixed recurrent state. The 24
+        # were counted from ssm_conv1d tensors in the GGUF, not derived from
+        # full_attention_interval, because 33 // 4 gives 8 and is wrong.
+        #
+        # The vocabulary is what makes this model different from the Qwen
+        # entries: 248,320 against 151,936. It drives the logits buffer,
+        # which is the largest batch-scaled allocation, so leaving it at the
+        # default would understate memory by about 100 MiB.
+        shape=ModelShape(n_layer=33, n_head_kv=4, head_dim=256, n_embd=4096,
+                         n_attn_layer=9, n_vocab=248320),
+        notes="Experimental",
+        n_ctx_train=262144,
+        tags=["medium", "hybrid"],
+    ),
+    Model(
         id="qwen38-27b-nf4dq",
         name="Qwen3.8 27B",
         repo="KayceeSamuel/Qwen3.8-27B-NF4DQ",
