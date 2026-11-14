@@ -21,7 +21,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14          # Apple Silicon
+          - os: macos-latest          # Apple Silicon
             label: macos-arm64
             artifact: ciu-macos-arm64
           - os: windows-latest
